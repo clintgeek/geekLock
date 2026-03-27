@@ -1,6 +1,7 @@
 use axum::{
-    extract::State,
+    extract::{State, DefaultBodyLimit},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -11,7 +12,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use tower_http::services::ServeDir;
+use tokio::signal;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 
 mod crypto;
 use crypto::{encrypt_envelope, decrypt_envelope, Envelope};
@@ -21,6 +23,27 @@ struct AppState {
     encrypt_count: AtomicUsize,
     decrypt_count: AtomicUsize,
     start_time: Instant,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// Utility to convert String/Display errors to our standard JSON error response
+fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!("Internal crypto error: {}", err);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: err.to_string() }),
+    )
+}
+
+fn client_error<E: std::fmt::Display>(err: E) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse { error: err.to_string() }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -53,7 +76,9 @@ struct StatsResponse {
 
 #[tokio::main]
 async fn main() {
-    // Load Master Key from environment
+    tracing_subscriber::fmt::init();
+
+    // Load Master Key from environment (fail fast if invalid)
     let key_hex = env::var("GEEKLOCK_MASTER_KEY").expect("GEEKLOCK_MASTER_KEY must be set");
     let master_key = decode_hex(&key_hex).expect("Invalid master key hex: must be 64 characters");
     
@@ -64,20 +89,50 @@ async fn main() {
         start_time: Instant::now(),
     });
 
-    // Setup routes
+    // Build our application with routes, fallback UI, limits, trace logging, and state.
     let app = Router::new()
         .route("/encrypt", post(encrypt_handler))
         .route("/decrypt", post(decrypt_handler))
         .route("/stats", get(stats_handler))
-        // Serve UI from src/static
         .fallback_service(ServeDir::new("src/static"))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10MB explicit hard limit to prevent OOM payloads
+        .layer(TraceLayer::new_for_http())              // HTTP access logging
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 9090));
-    println!("geekLock sidecar + Dashboard listening on http://{}", addr);
+    tracing::info!("geekLock sidecar listening on http://{}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("Graceful shutdown signal received, draining active requests and stopping...");
 }
 
 async fn stats_handler(
@@ -94,38 +149,48 @@ async fn stats_handler(
 async fn encrypt_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EncryptRequest>,
-) -> Result<Json<EncryptResponse>, (StatusCode, String)> {
-    state.encrypt_count.fetch_add(1, Ordering::Relaxed);
+) -> Result<Json<EncryptResponse>, (StatusCode, Json<ErrorResponse>)> {
     
-    let envelope = encrypt_envelope(payload.data.as_bytes(), &state.master_key)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Copy variables to move them securely into the spawn_blocking closure
+    let master_key = state.master_key;
+    let data_bytes = payload.data.into_bytes();
     
-    let bin = bincode::serialize(&envelope)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Perform blocking cryptographic operations off the main Tokio async scheduler
+    let envelope = tokio::task::spawn_blocking(move || {
+        encrypt_envelope(&data_bytes, &master_key)
+    })
+    .await
+    .map_err(internal_error)? // Catch the JoinError if the thread panicked (rare)
+    .map_err(internal_error)?; // Catch the inner crypto error
     
+    let bin = bincode::serialize(&envelope).map_err(internal_error)?;
     let b64 = STANDARD.encode(bin);
     
+    state.encrypt_count.fetch_add(1, Ordering::Relaxed);
     Ok(Json(EncryptResponse { envelope: b64 }))
 }
 
 async fn decrypt_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<DecryptRequest>,
-) -> Result<Json<DecryptResponse>, (StatusCode, String)> {
+) -> Result<Json<DecryptResponse>, (StatusCode, Json<ErrorResponse>)> {
+    
+    let bin = STANDARD.decode(&payload.envelope).map_err(client_error)?;
+    let envelope: Envelope = bincode::deserialize(&bin).map_err(client_error)?;
+    
+    let master_key = state.master_key;
+    
+    // Perform blocking decryption operations
+    let plaintext = tokio::task::spawn_blocking(move || {
+        decrypt_envelope(&envelope, &master_key)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(|e| (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: e })))?;
+    
+    let data = String::from_utf8(plaintext).map_err(client_error)?;
+    
     state.decrypt_count.fetch_add(1, Ordering::Relaxed);
-    
-    let bin = STANDARD.decode(payload.envelope)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid base64 encoding".to_string()))?;
-    
-    let envelope: Envelope = bincode::deserialize(&bin)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid envelope format: {}", e)))?;
-    
-    let plaintext = decrypt_envelope(&envelope, &state.master_key)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
-    
-    let data = String::from_utf8(plaintext)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Decrypted data is not valid UTF-8".to_string()))?;
-    
     Ok(Json(DecryptResponse { data }))
 }
 

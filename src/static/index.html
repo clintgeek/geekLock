@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>geekLock Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <h1>geekLock</h1>
+                <span class="subtitle">Security Sidecar</span>
+            </div>
+            <div class="status-badge" id="status-badge">System Healthy</div>
+        </header>
+        
+        <main>
+            <section class="metrics">
+                <div class="card">
+                    <h3>Encryptions</h3>
+                    <div class="value" id="encryptions">0</div>
+                    <div class="trend">Total Operations</div>
+                </div>
+                <div class="card">
+                    <h3>Decryptions</h3>
+                    <div class="value" id="decryptions">0</div>
+                    <div class="trend">Total Operations</div>
+                </div>
+                <div class="card">
+                    <h3>Service Uptime</h3>
+                    <div class="value" id="uptime">0s</div>
+                    <div class="trend">Since Last Boot</div>
+                </div>
+            </section>
+            
+            <section class="security-info card">
+                <div class="card-header">
+                    <h3>Cryptographic Boundary Status</h3>
+                    <span class="compliance-tag">FIPS 140-2 Logical Alignment</span>
+                </div>
+                <div class="indicator-grid">
+                    <div class="indicator">
+                        <div class="dot active"></div>
+                        <div class="info">
+                            <strong>Zeroize Memory Protection</strong>
+                            <p>Wiping keys from RAM post-operation</p>
+                        </div>
+                    </div>
+                    <div class="indicator">
+                        <div class="dot active"></div>
+                        <div class="info">
+                            <strong>Envelope Encryption</strong>
+                            <p>AES-256-GCM unique per-record DEKs</p>
+                        </div>
+                    </div>
+                    <div class="indicator">
+                        <div class="dot active"></div>
+                        <div class="info">
+                            <strong>AEAD Authenticity</strong>
+                            <p>Ensuring data integrity and origin</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
